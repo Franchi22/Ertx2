@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Historial de Rutas - ERTX</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    body { margin: 0; font-family: sans-serif; text-align: center; }
+    #map { height: 90vh; width: 100%; }
+    #formulario { padding: 10px; background: #f2f2f2; }
+    input, button { margin: 5px; padding: 6px 12px; }
+    #estadoSeguimiento { font-weight: bold; color: green; }
+    #estadoLED, #estadoMensaje, #alertaVisual { font-weight: bold; margin-left: 10px; }
+    #alertaVisual { color: red; }
+  </style>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-database-compat.js"></script>
+</head>
+<body>
+  <h2>📍 Historial de Rutas - ERTX</h2>
+  <div id="formulario">
+    <input type="text" id="deviceID" placeholder="ID del dispositivo (ej: ERTX001)" />
+    <button onclick="cargarRuta()">📦 Cargar Ruta</button>
+    <button onclick="exportarGPX()">⬇️ Exportar GPX</button>
+    <button onclick="exportarJSON()">📄 Exportar JSON</button>
+    <button onclick="exportarGPX_Iridium()">🚁 GPX Iridium</button>
+    <button onclick="exportarJSON_Iridium()">🚁 JSON Iridium</button>
+    <button onclick="centrarMapa()">🎯 Centrar</button>
+    <label><input type="checkbox" id="trazarRuta" checked /> Trazar ruta</label>
+    <button onclick="toggleActualizacion()" id="btnToggle">⏸️ Pausar</button>
+    <span id="estadoSeguimiento">🟢 Seguimiento activo</span><br />
+    <button onclick="toggleLED()">💡 LED</button>
+    <span id="estadoLED">Estado LED: 🟡 Esperando...</span><br />
+    <input type="text" id="mensajeInput" placeholder="Escribe un comando" />
+    <button onclick="enviarMensaje()">📤 Enviar</button>
+    <span id="estadoMensaje">⌛ Esperando...</span><br />
+    <button onclick="resetearAlerta()">❌ Quitar alerta</button>
+    <span id="alertaVisual">Sin alerta</span>
+  </div>
+
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    const firebaseConfig = {
+      apiKey: "TU_API_KEY",
+      authDomain: "ertx-7199e.firebaseapp.com",
+      databaseURL: "https://ertx-7199e-default-rtdb.firebaseio.com",
+      projectId: "ertx-7199e",
+      storageBucket: "ertx-7199e.appspot.com",
+      messagingSenderId: "XXXXXXX",
+      appId: "APP_ID"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    let estadoActualLED = false;
+
+    function toggleLED() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return alert("Ingrese un ID de dispositivo");
+      estadoActualLED = !estadoActualLED;
+      db.ref("comandos/" + deviceID).update({ led: estadoActualLED });
+      document.getElementById("estadoLED").innerText = "Estado LED: " + (estadoActualLED ? "🟢 Encendido" : "🔴 Apagado");
+    }
+
+    function enviarMensaje() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      const mensaje = document.getElementById("mensajeInput").value.trim();
+      if (!deviceID || !mensaje) return alert("Falta ID o mensaje");
+      db.ref("comandos/" + deviceID + "/mensaje").set(mensaje).then(() => {
+        document.getElementById("estadoMensaje").innerText = "✅ Enviado: " + mensaje;
+        document.getElementById("mensajeInput").value = "";
+      }).catch(() => {
+        document.getElementById("estadoMensaje").innerText = "❌ Error al enviar";
+      });
+    }
+
+    function resetearAlerta() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return alert("Falta ID");
+      db.ref("comandos/" + deviceID + "/alerta").set(false);
+      document.getElementById("alertaVisual").innerText = "Sin alerta";
+    }
+
+    function monitorearAlerta() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return;
+      db.ref("comandos/" + deviceID + "/alerta").on("value", snap => {
+        const estado = snap.val();
+        document.getElementById("alertaVisual").innerText = estado ? "🚨 Botón presionado!" : "Sin alerta";
+      });
+    }
+
+    document.getElementById("deviceID").addEventListener("change", monitorearAlerta);
+
+    const map = L.map('map').setView([18.4861, -69.9312], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // 🌐 Detectar interacción manual para pausar centrado
+    map.on('movestart', () => {
+      if (autoCenter) {
+        autoCenter = false;
+        console.log("📍 Seguimiento desactivado por el usuario");
+      }
+    });
+
+    let lineaRuta, marcador, ultimaPosicion = null, puntosRuta = [], autoCenter = true, smoothPan = false, actualizarActivo = true, intervalo, prevData = {};
+    let lineaIridium;
+
+    function generarPopup(p) {
+      return `<b>📍 Posición</b><br>Lat: ${p.lat?.toFixed(6)}<br>Lng: ${p.lng?.toFixed(6)}<br><br>` +
+             `<b>🚗 Velocidad</b><br>GPS: ${p.vel_gps?.toFixed(2) ?? '-'} km/h<br>MPU: ${p.vel_mpu?.toFixed(2) ?? '-'} m/s<br><br>` +
+             `<b>🧠 Aceleración (g)</b><br>X: ${p.accX?.toFixed(2)}, Y: ${p.accY?.toFixed(2)}, Z: ${p.accZ?.toFixed(2)}<br><br>` +
+             `<b>🔄 Giroscopio (°/s)</b><br>X: ${p.gyroX?.toFixed(2)}, Y: ${p.gyroY?.toFixed(2)}, Z: ${p.gyroZ?.toFixed(2)}`;
+    }
+
+    function toggleActualizacion() {
+      actualizarActivo = !actualizarActivo;
+      document.getElementById("btnToggle").textContent = actualizarActivo ? "⏸️ Pausar" : "▶️ Reanudar";
+      document.getElementById("estadoSeguimiento").textContent = actualizarActivo ? "🟢 Seguimiento activo" : "⏸️ Detenido";
+      document.getElementById("estadoSeguimiento").style.color = actualizarActivo ? "green" : "orange";
+      if (actualizarActivo) {
+        cargarTiempoReal();
+        intervalo = setInterval(cargarTiempoReal, 1000);
+      } else {
+        clearInterval(intervalo);
+      }
+    }
+
+    function centrarMapa() {
+      autoCenter = true;
+      smoothPan = true;
+      if (ultimaPosicion) map.flyTo(ultimaPosicion, 18);
+    }
+
+    async function cargarRuta() {
+      const device = document.getElementById("deviceID").value.trim();
+      if (!device) return;
+      const url = `https://ertx-7199e-default-rtdb.firebaseio.com/rutas/${device}.json`;
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!data) return alert("No hay datos");
+
+        puntosRuta = Object.values(data);
+        const coordenadas = puntosRuta.map(p => [p.lat, p.lng]);
+
+        if (lineaRuta) map.removeLayer(lineaRuta);
+        if (document.getElementById("trazarRuta").checked) {
+          lineaRuta = L.polyline(coordenadas, { color: 'blue' }).addTo(map);
+          map.fitBounds(lineaRuta.getBounds());
+        }
+
+        const ultimo = puntosRuta[puntosRuta.length - 1];
+        if (marcador) marcador.setLatLng([ultimo.lat, ultimo.lng]);
+        else marcador = L.marker([ultimo.lat, ultimo.lng]).addTo(map);
+        marcador.bindPopup(generarPopup(ultimo)).openPopup();
+        ultimaPosicion = [ultimo.lat, ultimo.lng];
+      } catch (err) {
+        alert("Error al cargar ruta");
+      }
+    }
+
+    async function cargarTiempoReal() {
+      if (!actualizarActivo) return;
+      const res = await fetch("https://ertx-7199e-default-rtdb.firebaseio.com/ertx.json");
+      const data = await res.json();
+      if (!data?.lat || !data?.lng) return;
+
+      const pos = [data.lat, data.lng];
+      ultimaPosicion = pos;
+
+      if (document.getElementById("trazarRuta").checked) {
+        puntosRuta.push(data);
+        if (lineaRuta) lineaRuta.addLatLng(pos);
+        else lineaRuta = L.polyline([pos], { color: 'blue' }).addTo(map);
+      }
+
+      if (marcador) marcador.setLatLng(pos).bindPopup(generarPopup(data));
+      else marcador = L.marker(pos).addTo(map).bindPopup(generarPopup(data));
+
+      if (autoCenter) {
+        if (smoothPan) {
+          map.flyTo(pos, map.getZoom());
+        } else {
+          map.setView(pos, map.getZoom());
+        }
+      }
+
+      cargarIridiumEnMapa();
+    }
+
+    async function cargarIridiumEnMapa() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return;
+
+      const url = `https://ertx-7199e-default-rtdb.firebaseio.com/iridium/${deviceID}.json`;
+      try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!data) return;
+
+        const coords = Object.values(data).map(p => [p.lat, p.lng]);
+        if (lineaIridium) map.removeLayer(lineaIridium);
+        lineaIridium = L.polyline(coords, { color: 'red' }).addTo(map);
+      } catch (err) {
+        console.warn("No se pudo cargar ruta Iridium");
+      }
+    }
+
+    function exportarGPX() {
+      if (!puntosRuta.length) return alert("No hay ruta");
+      let gpx = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="ERTX">\n<trk><trkseg>\n`;
+      for (let p of puntosRuta) gpx += `<trkpt lat="${p.lat}" lon="${p.lng}"></trkpt>\n`;
+      gpx += `</trkseg></trk></gpx>`;
+      const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "ruta_ertx.gpx";
+      a.click();
+    }
+
+    function exportarJSON() {
+      if (!puntosRuta.length) return alert("No hay ruta");
+      const blob = new Blob([JSON.stringify(puntosRuta, null, 2)], { type: 'application/json' });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "ruta_ertx.json";
+      a.click();
+    }
+
+    async function exportarGPX_Iridium() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return alert("Falta ID");
+      const url = `https://ertx-7199e-default-rtdb.firebaseio.com/iridium/${deviceID}.json`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!data) return alert("No hay datos Iridium");
+
+      let gpx = `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="ERTX">\n<trk><trkseg>\n`;
+      for (let p of Object.values(data)) gpx += `<trkpt lat="${p.lat}" lon="${p.lng}"></trkpt>\n`;
+      gpx += `</trkseg></trk></gpx>`;
+      const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "iridium_ruta.gpx";
+      a.click();
+    }
+
+    async function exportarJSON_Iridium() {
+      const deviceID = document.getElementById("deviceID").value.trim();
+      if (!deviceID) return alert("Falta ID");
+      const url = `https://ertx-7199e-default-rtdb.firebaseio.com/iridium/${deviceID}.json`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!data) return alert("No hay datos Iridium");
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "iridium_data.json";
+      a.click();
+    }
+
+    intervalo = setInterval(() => {
+      if (!document.getElementById("deviceID").value.trim()) cargarTiempoReal();
+    }, 1000);
+  </script>
+</body>
+</html>
