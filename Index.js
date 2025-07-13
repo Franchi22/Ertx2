@@ -12,7 +12,8 @@ app.post('/rockblock', (req, res) => {
   console.log(req.body); // Puedes agregar validaciones aquí
 
   // ✅ IMPORTANTE: responder 200 OK
-  res.status(200).send("OK");
+  res.status(200).end();  // ✅ Sin body
+
 });
 
 // 👇 Esta línea es fundamental para Render
